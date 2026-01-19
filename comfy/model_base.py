@@ -20,6 +20,7 @@ import comfy.ldm.hunyuan3dv2_1
 import comfy.ldm.hunyuan3dv2_1.hunyuandit
 import torch
 import logging
+import comfy.ldm.lightricks.av_model
 from comfy.ldm.modules.diffusionmodules.openaimodel import UNetModel, Timestep
 from comfy.ldm.cascade.stage_c import StageC
 from comfy.ldm.cascade.stage_b import StageB
@@ -47,6 +48,7 @@ import comfy.ldm.chroma_radiance.model
 import comfy.ldm.ace.model
 import comfy.ldm.omnigen.omnigen2
 import comfy.ldm.qwen_image.model
+import comfy.ldm.kandinsky5.model
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -134,7 +136,7 @@ class BaseModel(torch.nn.Module):
         if not unet_config.get("disable_unet_model_creation", False):
             if model_config.custom_operations is None:
                 fp8 = model_config.optimizations.get("fp8", False)
-                operations = comfy.ops.pick_operations(unet_config.get("dtype", None), self.manual_cast_dtype, fp8_optimizations=fp8, scaled_fp8=model_config.scaled_fp8, model_config=model_config)
+                operations = comfy.ops.pick_operations(unet_config.get("dtype", None), self.manual_cast_dtype, fp8_optimizations=fp8, model_config=model_config)
             else:
                 operations = model_config.custom_operations
             self.diffusion_model = unet_model(**unet_config, device=device, operations=operations)
@@ -329,18 +331,6 @@ class BaseModel(torch.nn.Module):
             extra_sds.append(self.model_config.process_clip_vision_state_dict_for_saving(clip_vision_state_dict))
 
         unet_state_dict = self.diffusion_model.state_dict()
-
-        if self.model_config.scaled_fp8 is not None:
-            unet_state_dict["scaled_fp8"] = torch.tensor([], dtype=self.model_config.scaled_fp8)
-
-        # Save mixed precision metadata
-        if hasattr(self.model_config, 'layer_quant_config') and self.model_config.layer_quant_config:
-            metadata = {
-                "format_version": "1.0",
-                "layers": self.model_config.layer_quant_config
-            }
-            unet_state_dict["_quantization_metadata"] = metadata
-
         unet_state_dict = self.model_config.process_unet_state_dict_for_saving(unet_state_dict)
 
         if self.model_type == ModelType.V_PREDICTION:
@@ -957,7 +947,7 @@ class GenmoMochi(BaseModel):
 
 class LTXV(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLUX, device=None):
-        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.lightricks.model.LTXVModel) #TODO
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.lightricks.model.LTXVModel)
 
     def extra_conds(self, **kwargs):
         out = super().extra_conds(**kwargs)
@@ -984,6 +974,60 @@ class LTXV(BaseModel):
         if denoise_mask is None:
             return timestep
         return self.diffusion_model.patchifier.patchify(((denoise_mask) * timestep.view([timestep.shape[0]] + [1] * (denoise_mask.ndim - 1)))[:, :1])[0]
+
+    def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
+        return latent_image
+
+class LTXAV(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLUX, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.lightricks.av_model.LTXAVModel) #TODO
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        attention_mask = kwargs.get("attention_mask", None)
+        if attention_mask is not None:
+            out['attention_mask'] = comfy.conds.CONDRegular(attention_mask)
+        cross_attn = kwargs.get("cross_attn", None)
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+
+        out['frame_rate'] = comfy.conds.CONDConstant(kwargs.get("frame_rate", 25))
+
+        denoise_mask = kwargs.get("concat_mask", kwargs.get("denoise_mask", None))
+
+        audio_denoise_mask = None
+        if denoise_mask is not None and "latent_shapes" in kwargs:
+            denoise_mask = utils.unpack_latents(denoise_mask, kwargs["latent_shapes"])
+            if len(denoise_mask) > 1:
+                audio_denoise_mask = denoise_mask[1]
+            denoise_mask = denoise_mask[0]
+
+        if denoise_mask is not None:
+            out["denoise_mask"] = comfy.conds.CONDRegular(denoise_mask)
+
+        if audio_denoise_mask is not None:
+            out["audio_denoise_mask"] = comfy.conds.CONDRegular(audio_denoise_mask)
+
+        keyframe_idxs = kwargs.get("keyframe_idxs", None)
+        if keyframe_idxs is not None:
+            out['keyframe_idxs'] = comfy.conds.CONDRegular(keyframe_idxs)
+
+        latent_shapes = kwargs.get("latent_shapes", None)
+        if latent_shapes is not None:
+            out['latent_shapes'] = comfy.conds.CONDConstant(latent_shapes)
+
+        return out
+
+    def process_timestep(self, timestep, x, denoise_mask=None, audio_denoise_mask=None, **kwargs):
+        v_timestep = timestep
+        a_timestep = timestep
+
+        if denoise_mask is not None:
+            v_timestep = self.diffusion_model.patchifier.patchify(((denoise_mask) * timestep.view([timestep.shape[0]] + [1] * (denoise_mask.ndim - 1)))[:, :1])[0]
+        if audio_denoise_mask is not None:
+            a_timestep = self.diffusion_model.a_patchifier.patchify(((audio_denoise_mask) * timestep.view([timestep.shape[0]] + [1] * (audio_denoise_mask.ndim - 1)))[:, :1, :, :1])[0]
+
+        return v_timestep, a_timestep
 
     def scale_latent_inpaint(self, sigma, noise, latent_image, **kwargs):
         return latent_image
@@ -1120,6 +1164,10 @@ class Lumina2(BaseModel):
             out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
             if 'num_tokens' not in out:
                 out['num_tokens'] = comfy.conds.CONDConstant(cross_attn.shape[1])
+
+        clip_text_pooled = kwargs.get("pooled_output", None)  # NewBie
+        if clip_text_pooled is not None:
+            out['clip_text_pooled'] = comfy.conds.CONDRegular(clip_text_pooled)
 
         return out
 
@@ -1642,3 +1690,49 @@ class HunyuanVideo15_SR_Distilled(HunyuanVideo15):
         out = super().extra_conds(**kwargs)
         out['disable_time_r'] = comfy.conds.CONDConstant(False)
         return out
+
+class Kandinsky5(BaseModel):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device, unet_model=comfy.ldm.kandinsky5.model.Kandinsky5)
+
+    def encode_adm(self, **kwargs):
+        return kwargs["pooled_output"]
+
+    def concat_cond(self, **kwargs):
+        noise = kwargs.get("noise", None)
+        device = kwargs["device"]
+        image = torch.zeros_like(noise)
+
+        mask = kwargs.get("concat_mask", kwargs.get("denoise_mask", None))
+        if mask is None:
+            mask = torch.zeros_like(noise)[:, :1]
+        else:
+            mask = 1.0 - mask
+            mask = utils.common_upscale(mask.to(device), noise.shape[-1], noise.shape[-2], "bilinear", "center")
+            if mask.shape[-3] < noise.shape[-3]:
+                mask = torch.nn.functional.pad(mask, (0, 0, 0, 0, 0, noise.shape[-3] - mask.shape[-3]), mode='constant', value=0)
+            mask = utils.resize_to_batch_size(mask, noise.shape[0])
+
+        return torch.cat((image, mask), dim=1)
+
+    def extra_conds(self, **kwargs):
+        out = super().extra_conds(**kwargs)
+        attention_mask = kwargs.get("attention_mask", None)
+        if attention_mask is not None:
+            out['attention_mask'] = comfy.conds.CONDRegular(attention_mask)
+        cross_attn = kwargs.get("cross_attn", None)
+        if cross_attn is not None:
+            out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+
+        time_dim_replace = kwargs.get("time_dim_replace", None)
+        if time_dim_replace is not None:
+            out['time_dim_replace'] = comfy.conds.CONDRegular(self.process_latent_in(time_dim_replace))
+
+        return out
+
+class Kandinsky5Image(Kandinsky5):
+    def __init__(self, model_config, model_type=ModelType.FLOW, device=None):
+        super().__init__(model_config, model_type, device=device)
+
+    def concat_cond(self, **kwargs):
+        return None

@@ -5,6 +5,7 @@ import torch
 import os
 import sys
 import json
+import glob
 import hashlib
 import inspect
 import traceback
@@ -295,7 +296,11 @@ class VAEDecode:
     DESCRIPTION = "Decodes latent images back into pixel space images."
 
     def decode(self, vae, samples):
-        images = vae.decode(samples["samples"])
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+
+        images = vae.decode(latent)
         if len(images.shape) == 5: #Combine batches
             images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
         return (images, )
@@ -343,7 +348,7 @@ class VAEEncode:
     CATEGORY = "latent"
 
     def encode(self, vae, pixels):
-        t = vae.encode(pixels[:,:,:,:3])
+        t = vae.encode(pixels)
         return ({"samples":t}, )
 
 class VAEEncodeTiled:
@@ -361,7 +366,7 @@ class VAEEncodeTiled:
     CATEGORY = "_for_testing"
 
     def encode(self, vae, pixels, tile_size, overlap, temporal_size=64, temporal_overlap=8):
-        t = vae.encode_tiled(pixels[:,:,:,:3], tile_x=tile_size, tile_y=tile_size, overlap=overlap, tile_t=temporal_size, overlap_t=temporal_overlap)
+        t = vae.encode_tiled(pixels, tile_x=tile_size, tile_y=tile_size, overlap=overlap, tile_t=temporal_size, overlap_t=temporal_overlap)
         return ({"samples": t}, )
 
 class VAEEncodeForInpaint:
@@ -374,14 +379,15 @@ class VAEEncodeForInpaint:
     CATEGORY = "latent/inpaint"
 
     def encode(self, vae, pixels, mask, grow_mask_by=6):
-        x = (pixels.shape[1] // vae.downscale_ratio) * vae.downscale_ratio
-        y = (pixels.shape[2] // vae.downscale_ratio) * vae.downscale_ratio
+        downscale_ratio = vae.spacial_compression_encode()
+        x = (pixels.shape[1] // downscale_ratio) * downscale_ratio
+        y = (pixels.shape[2] // downscale_ratio) * downscale_ratio
         mask = torch.nn.functional.interpolate(mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])), size=(pixels.shape[1], pixels.shape[2]), mode="bilinear")
 
         pixels = pixels.clone()
         if pixels.shape[1] != x or pixels.shape[2] != y:
-            x_offset = (pixels.shape[1] % vae.downscale_ratio) // 2
-            y_offset = (pixels.shape[2] % vae.downscale_ratio) // 2
+            x_offset = (pixels.shape[1] % downscale_ratio) // 2
+            y_offset = (pixels.shape[2] % downscale_ratio) // 2
             pixels = pixels[:,x_offset:x + x_offset, y_offset:y + y_offset,:]
             mask = mask[:,:,x_offset:x + x_offset, y_offset:y + y_offset]
 
@@ -783,6 +789,7 @@ class VAELoader:
 
     #TODO: scale factor?
     def load_vae(self, vae_name):
+        metadata = None
         if vae_name == "pixel_space":
             sd = {}
             sd["pixel_space_vae"] = torch.tensor(1.0)
@@ -793,8 +800,8 @@ class VAELoader:
                 vae_path = folder_paths.get_full_path_or_raise("vae_approx", vae_name)
             else:
                 vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-            sd = comfy.utils.load_torch_file(vae_path)
-        vae = comfy.sd.VAE(sd=sd)
+            sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
         return (vae,)
 
@@ -970,7 +977,7 @@ class DualCLIPLoader:
     def INPUT_TYPES(s):
         return {"required": { "clip_name1": (folder_paths.get_filename_list("text_encoders"), ),
                               "clip_name2": (folder_paths.get_filename_list("text_encoders"), ),
-                              "type": (["sdxl", "sd3", "flux", "hunyuan_video", "hidream", "hunyuan_image", "hunyuan_video_15"], ),
+                              "type": (["sdxl", "sd3", "flux", "hunyuan_video", "hidream", "hunyuan_image", "hunyuan_video_15", "kandinsky5", "kandinsky5_image", "ltxv", "newbie"], ),
                               },
                 "optional": {
                               "device": (["default", "cpu"], {"advanced": True}),
@@ -980,7 +987,7 @@ class DualCLIPLoader:
 
     CATEGORY = "advanced/loaders"
 
-    DESCRIPTION = "[Recipes]\n\nsdxl: clip-l, clip-g\nsd3: clip-l, clip-g / clip-l, t5 / clip-g, t5\nflux: clip-l, t5\nhidream: at least one of t5 or llama, recommended t5 and llama\nhunyuan_image: qwen2.5vl 7b and byt5 small"
+    DESCRIPTION = "[Recipes]\n\nsdxl: clip-l, clip-g\nsd3: clip-l, clip-g / clip-l, t5 / clip-g, t5\nflux: clip-l, t5\nhidream: at least one of t5 or llama, recommended t5 and llama\nhunyuan_image: qwen2.5vl 7b and byt5 small\nnewbie: gemma-3-4b-it, jina clip v2"
 
     def load_clip(self, clip_name1, clip_name2, type, device="default"):
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
@@ -1663,8 +1670,6 @@ class LoadImage:
         output_masks = []
         w, h = None, None
 
-        excluded_formats = ['MPO']
-
         for i in ImageSequence.Iterator(img):
             i = node_helpers.pillow(ImageOps.exif_transpose, i)
 
@@ -1692,7 +1697,10 @@ class LoadImage:
             output_images.append(image)
             output_masks.append(mask.unsqueeze(0))
 
-        if len(output_images) > 1 and img.format not in excluded_formats:
+            if img.format == "MPO":
+                break  # ignore all frames except the first one for MPO format
+
+        if len(output_images) > 1:
             output_image = torch.cat(output_images, dim=0)
             output_mask = torch.cat(output_masks, dim=0)
         else:
@@ -1863,6 +1871,7 @@ class ImageBatch:
     FUNCTION = "batch"
 
     CATEGORY = "image"
+    DEPRECATED = True
 
     def batch(self, image1, image2):
         if image1.shape[-1] != image2.shape[-1]:
@@ -2241,8 +2250,10 @@ async def init_external_custom_nodes():
 
         for possible_module in possible_modules:
             module_path = os.path.join(custom_node_path, possible_module)
-            if os.path.isfile(module_path) and os.path.splitext(module_path)[1] != ".py": continue
-            if module_path.endswith(".disabled"): continue
+            if os.path.isfile(module_path) and os.path.splitext(module_path)[1] != ".py":
+                continue
+            if module_path.endswith(".disabled"):
+                continue
             if args.disable_all_custom_nodes and possible_module not in args.whitelist_custom_nodes:
                 logging.info(f"Skipping {possible_module} due to disable_all_custom_nodes and whitelist_custom_nodes")
                 continue
@@ -2327,6 +2338,8 @@ async def init_builtin_extra_nodes():
         "nodes_mochi.py",
         "nodes_slg.py",
         "nodes_mahiro.py",
+        "nodes_lt_upsampler.py",
+        "nodes_lt_audio.py",
         "nodes_lt.py",
         "nodes_hooks.py",
         "nodes_load_3d.py",
@@ -2357,6 +2370,9 @@ async def init_builtin_extra_nodes():
         "nodes_rope.py",
         "nodes_logic.py",
         "nodes_nop.py",
+        "nodes_kandinsky5.py",
+        "nodes_wanmove.py",
+        "nodes_image_compare.py",
     ]
 
     import_failed = []
@@ -2369,38 +2385,12 @@ async def init_builtin_extra_nodes():
 
 async def init_builtin_api_nodes():
     api_nodes_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy_api_nodes")
-    api_nodes_files = [
-        "nodes_ideogram.py",
-        "nodes_openai.py",
-        "nodes_minimax.py",
-        "nodes_veo2.py",
-        "nodes_kling.py",
-        "nodes_bfl.py",
-        "nodes_bytedance.py",
-        "nodes_ltxv.py",
-        "nodes_luma.py",
-        "nodes_recraft.py",
-        "nodes_pixverse.py",
-        "nodes_stability.py",
-        "nodes_pika.py",
-        "nodes_runway.py",
-        "nodes_sora.py",
-        "nodes_topaz.py",
-        "nodes_tripo.py",
-        "nodes_moonvalley.py",
-        "nodes_rodin.py",
-        "nodes_gemini.py",
-        "nodes_vidu.py",
-        "nodes_wan.py",
-    ]
-
-    if not await load_custom_node(os.path.join(api_nodes_dir, "canary.py"), module_parent="comfy_api_nodes"):
-        return api_nodes_files
+    api_nodes_files = sorted(glob.glob(os.path.join(api_nodes_dir, "nodes_*.py")))
 
     import_failed = []
     for node_file in api_nodes_files:
-        if not await load_custom_node(os.path.join(api_nodes_dir, node_file), module_parent="comfy_api_nodes"):
-            import_failed.append(node_file)
+        if not await load_custom_node(node_file, module_parent="comfy_api_nodes"):
+            import_failed.append(os.path.basename(node_file))
 
     return import_failed
 
